@@ -1251,7 +1251,13 @@ static int read_aspect(const Tex *e, VkImageAspectFlags *a) {
     }
 }
 
-// Image <-> caller rows through a staging buffer; the GPU copy is waited for.
+// Image <-> caller rows through a staging buffer. A read waits for the GPU copy, since the caller gets the bytes back
+// here. A write does not: its staging buffer belongs to the upload batch, and queue order plus the batch's closing
+// barrier make the copy visible to the next submission that samples the image (vk.h, vk_upload_flush(0) in the replay).
+// WriteTexels is how the game updates its CPU-built textures -- OoT's water height and mask surfaces among them, which
+// are LINEAR_RENDER_TARGET and so gpu_owned (nvn_tex.h) and take this path every frame they change. Waiting for the
+// whole upload batch at each call stalled the guest thread holding the texture lock, which serialises every other
+// texture operation behind it; that is frame-time judder proportional to how often the CPU touches those surfaces.
 static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t *mem, int write) {
     static volatile int32_t n_astc, n_ds;
     VkCtx *c = vk_ctx();
@@ -1271,8 +1277,8 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     size_t texels = (size_t)w * h, ib = agpu ? 0 : astc ? 4 : rgb ? (size_t)g->bpb / 3 * 4 : 0;
     size_t slice = ib ? texels * ib : g->wb * g->hb;   // agpu: the raw blocks, decoded by vk_astc_record
     VkBuffer sb;
-    VmaAllocation sa;
-    uint8_t *stg = vk_staging(slice * (size_t)g->nz, &sb, &sa);
+    VmaAllocation sa = NULL;   // a write leaves the staging buffer to the batch; only a read owns (and destroys) it
+    uint8_t *stg = vk_staging(slice * (size_t)g->nz, &sb, write ? NULL : &sa);
     VkBufferImageCopy *rg = calloc((size_t)g->nz, sizeof *rg);
     for (int z = 0; z < g->nz; z++) {
         uint8_t *s = stg + slice * (size_t)z;
@@ -1300,7 +1306,7 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     }
     VkCommandBuffer cb = vk_upload_begin();
     if (write) {
-        vmaFlushAllocation(c->vma, sa, 0, VK_WHOLE_SIZE);
+        // vk_upload_flush flushes the batch's own staging allocations before it submits them.
         barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         int done = 0;
         // A BC3 image takes whole 4x4 blocks, or a part that ends on the mip's edge; a region of a 5x5 or 6x6 footprint
@@ -1330,8 +1336,8 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
                 VK_ACCESS_2_HOST_READ_BIT);
     }
     vk_upload_end();
-    vk_upload_flush(1);
     if (!write) {
+        vk_upload_flush(1);   // a read copies into stg: the bytes have to be there before they are handed back
         vmaInvalidateAllocation(c->vma, sa, 0, VK_WHOLE_SIZE);
         for (int z = 0; z < g->nz; z++) {
             const uint8_t *s = stg + slice * (size_t)z;
@@ -1343,7 +1349,7 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
         }
     }
     free(rg);
-    vmaDestroyBuffer(c->vma, sb, sa);
+    if (sa) vmaDestroyBuffer(c->vma, sb, sa);
     return 1;
 }
 
